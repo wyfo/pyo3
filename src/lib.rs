@@ -406,6 +406,8 @@ pub mod buffer;
 pub mod callback;
 pub mod conversion;
 mod conversions;
+#[cfg(feature = "macros")]
+pub mod coroutine;
 #[macro_use]
 #[doc(hidden)]
 pub mod derive_utils;

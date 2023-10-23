@@ -20,6 +20,7 @@ impl<T> SomeWrap<Option<T>> for Option<T> {
 /// Used to wrap the result of `#[pyfunction]` and `#[pymethods]`.
 pub trait OkWrap<T> {
     type Error;
+    fn wrap_no_gil(self) -> Result<T, Self::Error>;
     fn wrap(self, py: Python<'_>) -> Result<Py<PyAny>, Self::Error>;
 }
 
@@ -30,6 +31,9 @@ where
     T: IntoPy<PyObject>,
 {
     type Error = PyErr;
+    fn wrap_no_gil(self) -> Result<T, Self::Error> {
+        Ok(self)
+    }
     fn wrap(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         Ok(self.into_py(py))
     }
@@ -40,6 +44,9 @@ where
     T: IntoPy<PyObject>,
 {
     type Error = E;
+    fn wrap_no_gil(self) -> Result<T, Self::Error> {
+        self
+    }
     fn wrap(self, py: Python<'_>) -> Result<Py<PyAny>, Self::Error> {
         self.map(|o| o.into_py(py))
     }

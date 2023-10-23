@@ -6,6 +6,9 @@
 //! APIs may may change at any time without documentation in the CHANGELOG and without
 //! breaking semver guarantees.
 
+#[cfg(feature = "macros")]
+pub mod coroutine;
+#[cfg(feature = "macros")]
 pub mod deprecations;
 pub mod extract_argument;
 pub mod freelist;

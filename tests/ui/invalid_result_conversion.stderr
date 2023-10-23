@@ -5,6 +5,7 @@ error[E0277]: the trait bound `PyErr: From<MyError>` is not satisfied
    | ^^^^^^^^^^^^^ the trait `From<MyError>` is not implemented for `PyErr`
    |
    = help: the following other types implement trait `From<T>`:
+             <PyErr as From<coroutine::cancel::Cancellation>>
              <PyErr as From<PyBorrowError>>
              <PyErr as From<PyBorrowMutError>>
              <PyErr as From<std::io::Error>>
@@ -12,7 +13,6 @@ error[E0277]: the trait bound `PyErr: From<MyError>` is not satisfied
              <PyErr as From<NulError>>
              <PyErr as From<IntoStringError>>
              <PyErr as From<FromUtf8Error>>
-             <PyErr as From<FromUtf16Error>>
            and $N others
    = note: required for `MyError` to implement `Into<PyErr>`
    = note: this error originates in the attribute macro `pyfunction` (in Nightly builds, run with -Z macro-backtrace for more info)

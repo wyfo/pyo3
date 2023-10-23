@@ -516,6 +516,14 @@ impl<T: PyClass> PyCell<T> {
         #[allow(clippy::useless_conversion)]
         offset.try_into().expect("offset should fit in Py_ssize_t")
     }
+
+    pub(crate) fn release_ref(&self) {
+        self.borrow_checker().release_borrow();
+    }
+
+    pub(crate) fn release_mut(&self) {
+        self.borrow_checker().release_borrow_mut();
+    }
 }
 
 impl<T: PyClassImpl> PyCell<T> {

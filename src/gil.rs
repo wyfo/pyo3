@@ -507,7 +507,7 @@ fn decrement_gil_count() {
 #[cfg(test)]
 mod tests {
     use super::{gil_is_acquired, GILPool, GIL_COUNT, OWNED_OBJECTS, POOL};
-    use crate::{ffi, gil, PyObject, Python, ToPyObject};
+    use crate::{ffi, gil, py_run, wrap_pyfunction, PyObject, Python, ToPyObject};
     #[cfg(not(target_arch = "wasm32"))]
     use parking_lot::{const_mutex, Condvar, Mutex};
     use std::ptr::NonNull;
@@ -923,6 +923,46 @@ mod tests {
 
             // Updating the counts will call decref on the capsule, which calls capsule_drop
             POOL.update_counts(py);
+        })
+    }
+
+    #[test]
+    fn allow_threads_fn() {
+        #[crate::pyfunction(allow_threads, crate = "crate")]
+        fn without_gil() {
+            GIL_COUNT.with(|c| assert_eq!(c.get(), 0));
+        }
+        Python::with_gil(|gil| {
+            let without_gil = wrap_pyfunction!(without_gil, gil).unwrap();
+            py_run!(gil, without_gil, "without_gil()");
+        })
+    }
+
+    #[test]
+    fn allow_threads_async_fn() {
+        #[crate::pyfunction(allow_threads, crate = "crate")]
+        async fn without_gil() {
+            use std::task::Poll;
+            GIL_COUNT.with(|c| assert_eq!(c.get(), 0));
+            let mut ready = false;
+            futures_util::future::poll_fn(|cx| {
+                if ready {
+                    return Poll::Ready(());
+                }
+                ready = true;
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            })
+            .await;
+            GIL_COUNT.with(|c| assert_eq!(c.get(), 0));
+        }
+        Python::with_gil(|gil| {
+            let without_gil = wrap_pyfunction!(without_gil, gil).unwrap();
+            py_run!(
+                gil,
+                without_gil,
+                "import asyncio; asyncio.run(without_gil())"
+            );
         })
     }
 }

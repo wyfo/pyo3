@@ -1,12 +1,13 @@
+use crate::method::update_cancel_handle;
 use crate::{
     attributes::{
         self, get_pyo3_options, take_attributes, take_pyo3_options, CrateAttribute,
-        FromPyWithAttribute, NameAttribute, TextSignatureAttribute,
+        FromPyWithAttribute, KeywordAttribute, NameAttribute, NameLitStr, TextSignatureAttribute,
     },
     deprecations::Deprecations,
     method::{self, CallingConvention, FnArg},
     pymethod::check_generic,
-    utils::{ensure_not_async_fn, get_pyo3_crate},
+    utils::get_pyo3_crate,
 };
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
@@ -73,6 +74,8 @@ pub struct PyFunctionOptions {
     pub signature: Option<SignatureAttribute>,
     pub text_signature: Option<TextSignatureAttribute>,
     pub krate: Option<CrateAttribute>,
+    pub allow_threads: Option<attributes::kw::allow_threads>,
+    pub cancel_handle: Option<CancelHandleAttribute>,
 }
 
 impl Parse for PyFunctionOptions {
@@ -81,7 +84,9 @@ impl Parse for PyFunctionOptions {
 
         while !input.is_empty() {
             let lookahead = input.lookahead1();
-            if lookahead.peek(attributes::kw::name)
+            if lookahead.peek(attributes::kw::allow_threads)
+                || lookahead.peek(attributes::kw::cancel_handle)
+                || lookahead.peek(attributes::kw::name)
                 || lookahead.peek(attributes::kw::pass_module)
                 || lookahead.peek(attributes::kw::signature)
                 || lookahead.peek(attributes::kw::text_signature)
@@ -103,6 +108,8 @@ impl Parse for PyFunctionOptions {
 }
 
 pub enum PyFunctionOption {
+    AllowThreads(attributes::kw::allow_threads),
+    CancelHandle(CancelHandleAttribute),
     Name(NameAttribute),
     PassModule(attributes::kw::pass_module),
     Signature(SignatureAttribute),
@@ -113,7 +120,11 @@ pub enum PyFunctionOption {
 impl Parse for PyFunctionOption {
     fn parse(input: ParseStream<'_>) -> Result<Self> {
         let lookahead = input.lookahead1();
-        if lookahead.peek(attributes::kw::name) {
+        if lookahead.peek(attributes::kw::allow_threads) {
+            input.parse().map(PyFunctionOption::AllowThreads)
+        } else if lookahead.peek(attributes::kw::cancel_handle) {
+            input.parse().map(PyFunctionOption::CancelHandle)
+        } else if lookahead.peek(attributes::kw::name) {
             input.parse().map(PyFunctionOption::Name)
         } else if lookahead.peek(attributes::kw::pass_module) {
             input.parse().map(PyFunctionOption::PassModule)
@@ -153,6 +164,8 @@ impl PyFunctionOptions {
         }
         for attr in attrs {
             match attr {
+                PyFunctionOption::AllowThreads(allow_threads) => set_option!(allow_threads),
+                PyFunctionOption::CancelHandle(cancel_handle) => set_option!(cancel_handle),
                 PyFunctionOption::Name(name) => set_option!(name),
                 PyFunctionOption::PassModule(pass_module) => set_option!(pass_module),
                 PyFunctionOption::Signature(signature) => set_option!(signature),
@@ -163,6 +176,8 @@ impl PyFunctionOptions {
         Ok(())
     }
 }
+
+pub type CancelHandleAttribute = KeywordAttribute<attributes::kw::cancel_handle, NameLitStr>;
 
 pub fn build_py_function(
     ast: &mut syn::ItemFn,
@@ -179,9 +194,9 @@ pub fn impl_wrap_pyfunction(
     options: PyFunctionOptions,
 ) -> syn::Result<TokenStream> {
     check_generic(&func.sig)?;
-    ensure_not_async_fn(&func.sig)?;
-
     let PyFunctionOptions {
+        allow_threads,
+        cancel_handle,
         pass_module,
         name,
         signature,
@@ -214,6 +229,10 @@ pub fn impl_wrap_pyfunction(
         method::FnType::FnStatic
     };
 
+    if let Some(cancel_handle) = cancel_handle {
+        update_cancel_handle(func.sig.asyncness, &mut arguments, cancel_handle)?;
+    }
+
     let signature = if let Some(signature) = signature {
         FunctionSignature::from_arguments_and_attribute(arguments, signature)?
     } else {
@@ -230,6 +249,8 @@ pub fn impl_wrap_pyfunction(
         signature,
         output: ty,
         text_signature,
+        allow_threads,
+        asyncness: func.sig.asyncness,
         unsafety: func.sig.unsafety,
         deprecations: Deprecations::new(),
     };

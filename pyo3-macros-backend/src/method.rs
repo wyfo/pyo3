@@ -1,18 +1,19 @@
 use std::fmt::Display;
 
+use crate::attributes;
 use crate::attributes::{TextSignatureAttribute, TextSignatureAttributeValue};
 use crate::deprecations::{Deprecation, Deprecations};
 use crate::params::impl_arg_params;
-use crate::pyfunction::{FunctionSignature, PyFunctionArgPyO3Attributes};
+use crate::pyfunction::{CancelHandleAttribute, FunctionSignature, PyFunctionArgPyO3Attributes};
 use crate::pyfunction::{PyFunctionOptions, SignatureAttribute};
 use crate::quotes;
 use crate::utils::{self, PythonDoc};
 use proc_macro2::{Span, TokenStream};
-use quote::ToTokens;
+use quote::{format_ident, ToTokens};
 use quote::{quote, quote_spanned};
 use syn::ext::IdentExt;
 use syn::spanned::Spanned;
-use syn::{Ident, Result};
+use syn::{Ident, Result, Token};
 
 #[derive(Clone, Debug)]
 pub struct FnArg<'a> {
@@ -24,6 +25,7 @@ pub struct FnArg<'a> {
     pub attrs: PyFunctionArgPyO3Attributes,
     pub is_varargs: bool,
     pub is_kwargs: bool,
+    pub is_cancel_handle: bool,
 }
 
 impl<'a> FnArg<'a> {
@@ -53,10 +55,28 @@ impl<'a> FnArg<'a> {
                     attrs: arg_attrs,
                     is_varargs: false,
                     is_kwargs: false,
+                    is_cancel_handle: false,
                 })
             }
         }
     }
+}
+
+pub fn update_cancel_handle(
+    asyncness: Option<Token![async]>,
+    arguments: &mut [FnArg<'_>],
+    cancel_handle: CancelHandleAttribute,
+) -> Result<()> {
+    if asyncness.is_none() {
+        bail_spanned!(cancel_handle.kw.span() => "`cancel_handle` attribute only allowed with `async fn`");
+    }
+    for arg in arguments {
+        if arg.name == &cancel_handle.value.0 {
+            arg.is_cancel_handle = true;
+            return Ok(());
+        }
+    }
+    bail_spanned!(cancel_handle.value.span() => "missing cancel_handle argument")
 }
 
 fn handle_argument_error(pat: &syn::Pat) -> syn::Error {
@@ -113,7 +133,8 @@ impl FnType {
             }
             FnType::FnClass | FnType::FnNewClass => {
                 quote! {
-                    _pyo3::types::PyType::from_type_ptr(py, _slf as *mut _pyo3::ffi::PyTypeObject),
+                    #[allow(clippy::useless_conversion)]
+                    ::std::convert::Into::into(_pyo3::types::PyType::from_type_ptr(py, _slf as *mut _pyo3::ffi::PyTypeObject))
                 }
             }
             FnType::FnModule => {
@@ -228,8 +249,10 @@ pub struct FnSpec<'a> {
     pub output: syn::Type,
     pub convention: CallingConvention,
     pub text_signature: Option<TextSignatureAttribute>,
+    pub asyncness: Option<syn::Token![async]>,
     pub unsafety: Option<syn::Token![unsafe]>,
     pub deprecations: Deprecations,
+    pub allow_threads: Option<attributes::kw::allow_threads>,
 }
 
 pub fn get_return_info(output: &syn::ReturnType) -> syn::Type {
@@ -247,6 +270,14 @@ pub fn parse_method_receiver(arg: &syn::FnArg) -> Result<SelfType> {
             },
         ) => {
             bail_spanned!(recv.span() => RECEIVER_BY_VALUE_ERR);
+        }
+        // Async method use an unsafe trick with `'static` lifetime,
+        // so `&'static self` would compile if not prevented
+        syn::FnArg::Receiver(syn::Receiver {
+            reference: Some((_, Some(ref lifetime))),
+            ..
+        }) if lifetime.ident == "static" => {
+            bail_spanned!(lifetime.span() => STATIC_RECEIVER_ERR);
         }
         syn::FnArg::Receiver(recv @ syn::Receiver { mutability, .. }) => Ok(SelfType::Receiver {
             mutable: mutability.is_some(),
@@ -273,6 +304,8 @@ impl<'a> FnSpec<'a> {
             text_signature,
             name,
             signature,
+            allow_threads,
+            cancel_handle,
             ..
         } = options;
 
@@ -286,7 +319,7 @@ impl<'a> FnSpec<'a> {
         let ty = get_return_info(&sig.output);
         let python_name = python_name.as_ref().unwrap_or(name).unraw();
 
-        let arguments: Vec<_> = sig
+        let mut arguments: Vec<_> = sig
             .inputs
             .iter_mut()
             .skip(if fn_type.skip_first_rust_argument_in_python_signature() {
@@ -296,6 +329,10 @@ impl<'a> FnSpec<'a> {
             })
             .map(FnArg::parse)
             .collect::<Result<_>>()?;
+
+        if let Some(cancel_handle) = cancel_handle {
+            update_cancel_handle(sig.asyncness, &mut arguments, cancel_handle)?;
+        }
 
         let signature = if let Some(signature) = signature {
             FunctionSignature::from_arguments_and_attribute(arguments, signature)?
@@ -317,8 +354,10 @@ impl<'a> FnSpec<'a> {
             signature,
             output: ty,
             text_signature,
+            asyncness: sig.asyncness,
             unsafety: sig.unsafety,
             deprecations,
+            allow_threads,
         })
     }
 
@@ -445,7 +484,82 @@ impl<'a> FnSpec<'a> {
         let func_name = &self.name;
 
         let rust_call = |args: Vec<TokenStream>| {
-            quotes::map_result_into_ptr(quotes::ok_wrap(quote! { function(#self_arg #(#args),*) }))
+            let call = if self.asyncness.is_some() {
+                let cancel_handle = self
+                    .signature
+                    .arguments
+                    .iter()
+                    .find(|arg| arg.is_cancel_handle);
+                let allow_threads = self.allow_threads.is_some();
+                let throw_callback = if cancel_handle.is_some() {
+                    quote! { __throw_callback }
+                } else {
+                    quote! { _pyo3::coroutine::raise_on_throw }
+                };
+                let python_name = &self.python_name;
+                let qualname = match cls {
+                    Some(cls) => quote! {
+                        Some(_pyo3::impl_::coroutine::method_coroutine_qualname::<#cls>(py, stringify!(#python_name)))
+                    },
+                    None => quote! {
+                        _pyo3::impl_::coroutine::coroutine_qualname(py, py.from_borrowed_ptr_or_opt::<_pyo3::types::PyModule>(_slf), stringify!(#python_name))
+                    },
+                };
+                let future = match self.tp {
+                    FnType::Fn(SelfType::Receiver { mutable: false, .. }) => quote! {
+                        _pyo3::impl_::coroutine::ref_method_future(
+                            py.from_borrowed_ptr::<_pyo3::types::PyAny>(_slf),
+                            move |__self| function(__self, #(#args),*)
+                        )?
+                    },
+                    FnType::Fn(SelfType::Receiver { mutable: true, .. }) => quote! {
+                        _pyo3::impl_::coroutine::mut_method_future(
+                            py.from_borrowed_ptr::<_pyo3::types::PyAny>(_slf),
+                            move |__self| function(__self, #(#args),*)
+                        )?
+                    },
+                    _ => quote! { function(#self_arg #(#args),*) },
+                };
+                let mut call = quote! {{
+                    let future = #future;
+                    _pyo3::coroutine::Coroutine::new::<_, _, _pyo3::coroutine::asyncio::Waker, #allow_threads>(
+                        Some(_pyo3::impl_::coroutine::coroutine_name(py, stringify!(#python_name))),
+                        #qualname,
+                        async move { _pyo3::impl_::wrap::OkWrap::wrap_no_gil(future.await) },
+                        #throw_callback,
+                    )
+                }};
+                if cancel_handle.is_some() {
+                    call = quote! {{
+                        let __cancel_handle = _pyo3::coroutine::CancelHandle::new();
+                        let __throw_callback = __cancel_handle.throw_callback();
+                        #call
+                    }};
+                }
+                call
+            } else if self.allow_threads.is_some() {
+                let (self_arg_name, self_arg_decl) = if self_arg.is_empty() {
+                    (quote!(), quote!())
+                } else {
+                    (quote!(__self), quote! { let __self = #self_arg; })
+                };
+                let arg_names: Vec<Ident> = (0..args.len())
+                    .map(|i| format_ident!("__arg{}", i))
+                    .collect();
+                let arg_decls: Vec<TokenStream> = args
+                    .into_iter()
+                    .zip(&arg_names)
+                    .map(|(arg, name)| quote! { let #name = #arg; })
+                    .collect();
+                quote! {{
+                    #self_arg_decl
+                    #(#arg_decls)*
+                    py.allow_threads(|| function(#self_arg_name #(#arg_names),*))
+                }}
+            } else {
+                quote! { function(#self_arg #(#args),*) }
+            };
+            quotes::map_result_into_ptr(quotes::ok_wrap(call))
         };
 
         let rust_name = if let Some(cls) = cls {
@@ -773,6 +887,7 @@ const IMPL_TRAIT_ERR: &str = "Python functions cannot have `impl Trait` argument
 const RECEIVER_BY_VALUE_ERR: &str =
     "Python objects are shared, so 'self' cannot be moved out of the Python interpreter.
 Try `&self`, `&mut self, `slf: PyRef<'_, Self>` or `slf: PyRefMut<'_, Self>`.";
+const STATIC_RECEIVER_ERR: &str = "Methods cannot have receiver with `'static` lifetime";
 
 fn ensure_signatures_on_valid_method(
     fn_type: &FnType,
