@@ -4,8 +4,11 @@ use crate::coroutine::waker::Waker;
 use crate::exceptions::{PyAttributeError, PyRuntimeError, PyRuntimeWarning, PyStopIteration};
 use crate::pyclass::IterNextOutput;
 use crate::{IntoPy, Py, PyAny, PyErr, PyObject, PyResult, Python};
+use futures_util::future::CatchUnwind;
+use futures_util::FutureExt;
 use pyo3_macros::{pyclass, pymethods};
 use std::future::Future;
+use std::panic;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -40,13 +43,16 @@ trait CoroutineImpl {
 }
 
 struct CoroutineInner<F, W, TC, const ALLOW_THREADS: bool> {
-    future: Option<F>,
+    // Future is UnwindSafe because it's dropped on panic
+    future: Option<CatchUnwind<panic::AssertUnwindSafe<F>>>,
     waker: Option<Arc<Waker<W>>>,
     throw_callback: TC,
 }
 
 impl<F, W, TC, const ALLOW_THREADS: bool> CoroutineInner<F, W, TC, ALLOW_THREADS> {
-    fn complete(&mut self) {
+    /// Drop Rust future, setting field to `None` to indicate
+    /// the coroutine has been run to completion
+    fn finalize(&mut self) {
         // the Rust future is dropped, and the field set to `None`
         // to indicate the coroutine has been run to completion
         drop(self.future.take());
@@ -80,13 +86,13 @@ where
             match prev_result {
                 Some(Err(err)) => {
                     if let Err(err) = (self.throw_callback)(err.as_ref(py)) {
-                        self.complete();
+                        self.finalize();
                         return Err(err);
                     }
                     prev_result = Some(Ok(py.None()));
                 }
                 None => {
-                    self.complete();
+                    self.finalize();
                     return Ok(IterNextOutput::Return(py.None()));
                 }
                 res => prev_result = res,
@@ -99,20 +105,24 @@ where
             self.waker = Some(Arc::new(Waker::new(prev_result)));
         }
         let waker = std::task::Waker::from(self.waker.clone().unwrap());
-        let poll = if ALLOW_THREADS {
-            py.allow_threads(|| future_rs.poll(&mut Context::from_waker(&waker)))
+        let poll = || future_rs.poll(&mut Context::from_waker(&waker));
+        let poll_result = if ALLOW_THREADS {
+            py.allow_threads(poll)
         } else {
-            future_rs.poll(&mut Context::from_waker(&waker))
+            poll()
         };
         // poll the Rust future and forward its results if ready
-        if let Poll::Ready(res) = poll {
-            self.complete();
-            return Ok(IterNextOutput::Return(res?.into_py(py)));
+        if let Poll::Ready(res) = poll_result {
+            self.finalize();
+            match res {
+                Ok(res) => return Ok(IterNextOutput::Return(res?.into_py(py))),
+                Err(panic) => panic::resume_unwind(panic),
+            }
         }
         match self.waker.as_ref().unwrap().yield_(py) {
             Ok(to_yield) => Ok(IterNextOutput::Yield(to_yield)),
             Err(err) => {
-                self.complete();
+                self.finalize();
                 Err(err)
             }
         }
@@ -171,7 +181,7 @@ impl Coroutine {
             name,
             qualname,
             implem: Box::new(CoroutineInner::<_, W, _, ALLOW_THREADS> {
-                future: Some(future),
+                future: Some(panic::AssertUnwindSafe(future).catch_unwind()),
                 waker: None,
                 throw_callback,
             }),
